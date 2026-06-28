@@ -1,0 +1,89 @@
+name: Build ESP32-C3 SuperMini Firmware
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  build-espidf:
+    name: Build ESP32-C3 Firmware
+    runs-on: ubuntu-latest
+    container: espressif/idf:release-v5.2
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          submodules: 'recursive'
+
+      - name: Compile ESP-IDF Project
+        shell: bash
+        run: |
+          # Source the IDF environment variables
+          . /opt/esp/idf/export.sh
+          
+          # Fix the git dubious ownership warning
+          git config --global --add safe.directory "*"
+          
+          # Create a flat output directory
+          mkdir -p build_out
+          
+          echo "=========================================="
+          echo "Compiling ESP32-C3 SuperMini Project"
+          echo "=========================================="
+          
+          # Auto-repair spaces to equals signs in sdkconfig.defaults
+          if [ -f "sdkconfig.defaults" ]; then
+              echo "Auto-repairing sdkconfig.defaults format..."
+              sed -i 's/CONFIG_\([A-Za-z0-9_]*\) \([-0-9A-Za-z_]*\)/CONFIG_\1=\2/g' sdkconfig.defaults
+          fi
+          
+          # Set target chip to ESP32-C3
+          idf.py set-target esp32c3
+          
+          # Compile the project
+          idf.py build
+          
+          # Copy the required binaries directly to build_out/
+          cp "build/bootloader/bootloader.bin" "build_out/" 2>/dev/null || true
+          
+          # Copy partition table as both names for flasher tool compatibility
+          cp "build/partition_table/partition-table.bin" "build_out/partition-table.bin" 2>/dev/null || true
+          cp "build/partition_table/partition-table.bin" "build_out/partitions.bin" 2>/dev/null || true
+          
+          # Find and copy the main app binary in the root of the build folder
+          find build -maxdepth 1 -name "*.bin" -exec cp {} "build_out/" \;
+          
+          # Find the exact name of the compiled application binary for the manifest
+          app_bin=$(find build_out -maxdepth 1 -name "*.bin" ! -name "bootloader.bin" ! -name "partition-table.bin" ! -name "partitions.bin" -exec basename {} \;)
+          
+          # Default to a fallback name if the dynamic search fails
+          if [ -z "$app_bin" ]; then
+              app_bin="firmware.bin"
+          fi
+          
+          # Generate a Web Flasher Manifest for 1-click installation via WebSerial tools
+          echo "Generating Web Flasher manifest.json..."
+          echo '{' > build_out/manifest.json
+          echo '  "name": "ESP32-C3-SuperMini",' >> build_out/manifest.json
+          echo '  "version": "1.0.0",' >> build_out/manifest.json
+          echo '  "builds": [' >> build_out/manifest.json
+          echo "    {" >> build_out/manifest.json
+          echo '      "chipFamily": "ESP32-C3",' >> build_out/manifest.json
+          echo '      "parts": [' >> build_out/manifest.json
+          echo '        { "path": "bootloader.bin", "offset": 0 },' >> build_out/manifest.json
+          echo '        { "path": "partitions.bin", "offset": 32768 },' >> build_out/manifest.json
+          echo "        { \"path\": \"$app_bin\", \"offset\": 65536 }" >> build_out/manifest.json
+          echo "      ]" >> build_out/manifest.json
+          echo "    }" >> build_out/manifest.json
+          echo "  ]" >> build_out/manifest.json
+          echo "}" >> build_out/manifest.json
+
+      - name: Upload ESP-IDF Compiled Binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: esp32-c3-binaries
+          path: build_out/
