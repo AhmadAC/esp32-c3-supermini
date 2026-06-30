@@ -329,6 +329,10 @@ extern "C" void app_main(void) {
 
     ESP_ERROR_CHECK(esp_wifi_start());
 
+    // Fix for ESP32-C3 SuperMini Wi-Fi dropout & invisibility issues
+    ESP_LOGI(TAG, "Configuring TX Power to 8.5 dBm to mitigate onboard antenna mismatch...");
+    ESP_ERROR_CHECK(esp_wifi_set_max_tx_power(34)); // 34 * 0.25 dBm = 8.5 dBm
+
     // 5. Connect to network if credentials exist
     if (has_creds) {
         ESP_LOGI(TAG, "Connecting to saved network: %s", ssid);
