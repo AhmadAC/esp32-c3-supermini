@@ -72,11 +72,12 @@ void motor_control_task(void *pvParameter) {
     while (1) {
         if (breeze_mode) {
             float nxt = current_throttle + (loop_dir * step);
-            if (nxt >= 100.0f || nxt <= 30.0f) {
+            // Drop down to 5% UI (which physically maps to ~52.5% power to prevent stall)
+            if (nxt >= 100.0f || nxt <= 5.0f) {
                 loop_dir *= -1.0f;
             }
             if (nxt > 100.0f) nxt = 100.0f;
-            if (nxt < 30.0f) nxt = 30.0f;
+            if (nxt < 5.0f) nxt = 5.0f;
             current_throttle = nxt;
         } else {
             float diff = target_throttle - current_throttle;
@@ -87,20 +88,27 @@ void motor_control_task(void *pvParameter) {
             }
         }
 
-        uint32_t duty = (uint32_t)(fabs(current_throttle) / 100.0f * 1023.0f);
-        if (duty > 1023) duty = 1023;
+        uint32_t duty = 0;
+        if (fabs(current_throttle) > 0.1f) {
+            // Deadband Fix: Remap 0->100% UI throttle to 50%->100% physical duty cycle (512 -> 1023)
+            duty = 512 + (uint32_t)((fabs(current_throttle) / 100.0f) * 511.0f);
+            if (duty > 1023) duty = 1023;
+        }
 
         if (current_throttle > 0.1f) {
-            ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, duty);
-            ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
-            ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, 0);
-            ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1);
-        } else if (current_throttle < -0.1f) {
+            // Forward (Channels swapped to fix backwards rotation)
             ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, 0);
             ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
             ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, duty);
             ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1);
+        } else if (current_throttle < -0.1f) {
+            // Reverse (Channels swapped to fix backwards rotation)
+            ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, duty);
+            ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
+            ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, 0);
+            ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1);
         } else {
+            // Stopped
             ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, 0);
             ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
             ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, 0);
@@ -492,7 +500,7 @@ void start_webserver(void) {
         httpd_config_t config = HTTPD_DEFAULT_CONFIG();
         config.max_uri_handlers = 16;
         config.stack_size = 8192;
-        config.uri_match_fn = httpd_uri_match_wildcard; // ENABLES WILDCARD MATCHING
+        config.uri_match_fn = httpd_uri_match_wildcard;
         
         if (httpd_start(&server, &config) == ESP_OK) {
             httpd_uri_t uri_root     = { .uri = "/", .method = HTTP_GET, .handler = root_get_handler, .user_ctx = NULL };
@@ -519,8 +527,6 @@ void start_webserver(void) {
             httpd_register_uri_handler(server, &uri_stop);
             httpd_register_uri_handler(server, &uri_loop);
             httpd_register_uri_handler(server, &uri_favicon);
-            
-            // Register Catch-all to intercept OS checks silently
             httpd_register_uri_handler(server, &uri_catchall);
             
             ESP_LOGI(TAG, "Web Server started on port %d", config.server_port);
