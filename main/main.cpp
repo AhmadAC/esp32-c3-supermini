@@ -15,6 +15,10 @@
 #include "cJSON.h"
 #include "esp_timer.h"
 #include "driver/ledc.h"
+#include "lwip/sockets.h"
+#include "lwip/sys.h"
+#include "lwip/netdb.h"
+#include "lwip/err.h"
 
 static const char *TAG = "SUPERMINI";
 
@@ -25,6 +29,8 @@ static bool ap_fallback_active = false;
 // ============================================================================
 // MOTOR CONTROL GLOBALS & TASK
 // ============================================================================
+// Connect IN-A on the L9110S to GPIO 6 (labeled 6 or G6 on the SuperMini silkscreen).
+// Connect IN-B on the L9110S to GPIO 5 (labeled 5 or G5 on the SuperMini silkscreen).
 #define MOTOR_PIN_A 6
 #define MOTOR_PIN_B 5
 
@@ -129,6 +135,66 @@ void console_task(void *pvParameters) {
 }
 
 // ============================================================================
+// CAPTIVE PORTAL DNS TASK
+// ============================================================================
+// Intercepts all DNS queries from connected smartphones and redirects 
+// them back to the ESP32 (192.168.4.1). This triggers the automatic "Sign in" popup.
+void dns_server_task(void *pvParameters) {
+    struct sockaddr_in serv_addr;
+    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (sock < 0) {
+        ESP_LOGE(TAG, "DNS socket failed");
+        vTaskDelete(NULL);
+        return;
+    }
+    
+    memset(&serv_addr, 0, sizeof(serv_addr));
+    serv_addr.sin_family = AF_INET;
+    serv_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    serv_addr.sin_port = htons(53);
+    
+    if (bind(sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
+        ESP_LOGE(TAG, "DNS bind failed");
+        close(sock);
+        vTaskDelete(NULL);
+        return;
+    }
+    
+    char rx_buffer[128];
+    char tx_buffer[128];
+    struct sockaddr_in source_addr;
+    socklen_t addr_len = sizeof(source_addr);
+    
+    ESP_LOGI(TAG, "Captive Portal DNS Server listening on port 53");
+    
+    while (1) {
+        int len = recvfrom(sock, rx_buffer, sizeof(rx_buffer), 0, (struct sockaddr *)&source_addr, &addr_len);
+        if (len > 12) {
+            if (len > (int)sizeof(tx_buffer)) len = sizeof(tx_buffer);
+            memcpy(tx_buffer, rx_buffer, len);
+            
+            // Set QR flag to 1 (response)
+            tx_buffer[2] |= 0x80; 
+            // Copy QDCOUNT to ANCOUNT
+            tx_buffer[6] = tx_buffer[4]; 
+            tx_buffer[7] = tx_buffer[5];
+            
+            int p = len;
+            if (p + 16 <= (int)sizeof(tx_buffer)) {
+                tx_buffer[p++] = 0xC0; tx_buffer[p++] = 0x0C; // Pointer
+                tx_buffer[p++] = 0x00; tx_buffer[p++] = 0x01; // Type A
+                tx_buffer[p++] = 0x00; tx_buffer[p++] = 0x01; // Class IN
+                tx_buffer[p++] = 0x00; tx_buffer[p++] = 0x00; tx_buffer[p++] = 0x00; tx_buffer[p++] = 0x3C; // TTL 60
+                tx_buffer[p++] = 0x00; tx_buffer[p++] = 0x04; // RDLENGTH 4
+                tx_buffer[p++] = 192; tx_buffer[p++] = 168; tx_buffer[p++] = 4; tx_buffer[p++] = 1; // IP (192.168.4.1)
+                sendto(sock, tx_buffer, p, 0, (struct sockaddr *)&source_addr, sizeof(source_addr));
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+
+// ============================================================================
 // WI-FI EVENT HANDLER
 // ============================================================================
 static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data) {
@@ -176,10 +242,18 @@ static void delayed_reboot_task(void *pvParameter) {
 static esp_err_t root_get_handler(httpd_req_t *req) {
     httpd_resp_set_status(req, "302 Found");
     if (ap_fallback_active) {
-        httpd_resp_set_hdr(req, "Location", "/setup");
+        httpd_resp_set_hdr(req, "Location", "http://192.168.4.1/setup");
     } else {
         httpd_resp_set_hdr(req, "Location", "/app");
     }
+    httpd_resp_send(req, NULL, 0);
+    return ESP_OK;
+}
+
+// Captive portal 404 handler: intercepts all OS connectivity checks and sends them to setup
+static esp_err_t not_found_handler(httpd_req_t *req, httpd_err_code_t err) {
+    httpd_resp_set_status(req, "302 Found");
+    httpd_resp_set_hdr(req, "Location", "http://192.168.4.1/setup");
     httpd_resp_send(req, NULL, 0);
     return ESP_OK;
 }
@@ -446,6 +520,9 @@ void start_webserver(void) {
             httpd_register_uri_handler(server, &uri_loop);
             httpd_register_uri_handler(server, &uri_favicon);
             
+            // Register Captive Portal 404 Handler
+            httpd_register_err_handler(server, HTTPD_404_NOT_FOUND, not_found_handler);
+            
             ESP_LOGI(TAG, "Web Server started on port %d", config.server_port);
         }
     }
@@ -468,6 +545,7 @@ extern "C" void app_main(void) {
     init_motor_pwm();
     xTaskCreate(motor_control_task, "motor_task", 4096, NULL, 4, NULL);
     xTaskCreate(console_task, "console_task", 4096, NULL, 5, NULL);
+    xTaskCreate(dns_server_task, "dns_task", 4096, NULL, 5, NULL); // Start DNS interceptor task
 
     // 3. Initialize Network Base
     ESP_ERROR_CHECK(esp_netif_init());
