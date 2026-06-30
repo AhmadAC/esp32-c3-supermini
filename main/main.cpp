@@ -29,8 +29,6 @@ static bool ap_fallback_active = false;
 // ============================================================================
 // MOTOR CONTROL GLOBALS & TASK
 // ============================================================================
-// Connect IN-A on the L9110S to GPIO 6 (labeled 6 or G6 on the SuperMini silkscreen).
-// Connect IN-B on the L9110S to GPIO 5 (labeled 5 or G5 on the SuperMini silkscreen).
 #define MOTOR_PIN_A 6
 #define MOTOR_PIN_B 5
 
@@ -70,7 +68,7 @@ void init_motor_pwm(void) {
 }
 
 void motor_control_task(void *pvParameter) {
-    const float step = 5.0f; // 5 percent per 100ms prevents brownouts
+    const float step = 5.0f; 
     while (1) {
         if (breeze_mode) {
             float nxt = current_throttle + (loop_dir * step);
@@ -137,8 +135,6 @@ void console_task(void *pvParameters) {
 // ============================================================================
 // CAPTIVE PORTAL DNS TASK
 // ============================================================================
-// Intercepts all DNS queries from connected smartphones and redirects 
-// them back to the ESP32 (192.168.4.1). This triggers the automatic "Sign in" popup.
 void dns_server_task(void *pvParameters) {
     struct sockaddr_in serv_addr;
     int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
@@ -173,20 +169,18 @@ void dns_server_task(void *pvParameters) {
             if (len > (int)sizeof(tx_buffer)) len = sizeof(tx_buffer);
             memcpy(tx_buffer, rx_buffer, len);
             
-            // Set QR flag to 1 (response)
             tx_buffer[2] |= 0x80; 
-            // Copy QDCOUNT to ANCOUNT
             tx_buffer[6] = tx_buffer[4]; 
             tx_buffer[7] = tx_buffer[5];
             
             int p = len;
             if (p + 16 <= (int)sizeof(tx_buffer)) {
-                tx_buffer[p++] = 0xC0; tx_buffer[p++] = 0x0C; // Pointer
-                tx_buffer[p++] = 0x00; tx_buffer[p++] = 0x01; // Type A
-                tx_buffer[p++] = 0x00; tx_buffer[p++] = 0x01; // Class IN
-                tx_buffer[p++] = 0x00; tx_buffer[p++] = 0x00; tx_buffer[p++] = 0x00; tx_buffer[p++] = 0x3C; // TTL 60
-                tx_buffer[p++] = 0x00; tx_buffer[p++] = 0x04; // RDLENGTH 4
-                tx_buffer[p++] = 192; tx_buffer[p++] = 168; tx_buffer[p++] = 4; tx_buffer[p++] = 1; // IP (192.168.4.1)
+                tx_buffer[p++] = 0xC0; tx_buffer[p++] = 0x0C; 
+                tx_buffer[p++] = 0x00; tx_buffer[p++] = 0x01; 
+                tx_buffer[p++] = 0x00; tx_buffer[p++] = 0x01; 
+                tx_buffer[p++] = 0x00; tx_buffer[p++] = 0x00; tx_buffer[p++] = 0x00; tx_buffer[p++] = 0x3C; 
+                tx_buffer[p++] = 0x00; tx_buffer[p++] = 0x04; 
+                tx_buffer[p++] = 192; tx_buffer[p++] = 168; tx_buffer[p++] = 4; tx_buffer[p++] = 1; 
                 sendto(sock, tx_buffer, p, 0, (struct sockaddr *)&source_addr, sizeof(source_addr));
             }
         }
@@ -238,7 +232,6 @@ static void delayed_reboot_task(void *pvParameter) {
     esp_restart();
 }
 
-// Root page intelligently redirects to either /setup or /app based on connection state
 static esp_err_t root_get_handler(httpd_req_t *req) {
     httpd_resp_set_status(req, "302 Found");
     if (ap_fallback_active) {
@@ -250,10 +243,14 @@ static esp_err_t root_get_handler(httpd_req_t *req) {
     return ESP_OK;
 }
 
-// Captive portal 404 handler: intercepts all OS connectivity checks and sends them to setup
-static esp_err_t not_found_handler(httpd_req_t *req, httpd_err_code_t err) {
+// Intercepts all OS connectivity checks seamlessly (silences "URI not found" warnings)
+static esp_err_t captive_portal_wildcard_handler(httpd_req_t *req) {
     httpd_resp_set_status(req, "302 Found");
-    httpd_resp_set_hdr(req, "Location", "http://192.168.4.1/setup");
+    if (ap_fallback_active) {
+        httpd_resp_set_hdr(req, "Location", "http://192.168.4.1/setup");
+    } else {
+        httpd_resp_set_hdr(req, "Location", "/app");
+    }
     httpd_resp_send(req, NULL, 0);
     return ESP_OK;
 }
@@ -368,7 +365,6 @@ static esp_err_t app_get_handler(httpd_req_t *req) {
     return ESP_OK;
 }
 
-// Reusable JSON POST extractor
 static esp_err_t get_post_json(httpd_req_t *req, cJSON **json_out) {
     *json_out = NULL;
     int total_len = req->content_len;
@@ -398,7 +394,7 @@ static esp_err_t scan_get_handler(httpd_req_t *req) {
         uint16_t ap_count = 0;
         esp_wifi_scan_get_ap_num(&ap_count);
         if (ap_count > 0) {
-            if (ap_count > 30) ap_count = 30; // Max out at 30 to save heap
+            if (ap_count > 30) ap_count = 30;
             wifi_ap_record_t *ap_info = (wifi_ap_record_t *)malloc(sizeof(wifi_ap_record_t) * ap_count);
             if (ap_info != NULL) {
                 if (esp_wifi_scan_get_ap_records(&ap_count, ap_info) == ESP_OK) {
@@ -494,8 +490,9 @@ static esp_err_t favicon_get_handler(httpd_req_t *req) {
 void start_webserver(void) {
     if (server == NULL) {
         httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-        config.max_uri_handlers = 12;
+        config.max_uri_handlers = 16;
         config.stack_size = 8192;
+        config.uri_match_fn = httpd_uri_match_wildcard; // ENABLES WILDCARD MATCHING
         
         if (httpd_start(&server, &config) == ESP_OK) {
             httpd_uri_t uri_root     = { .uri = "/", .method = HTTP_GET, .handler = root_get_handler, .user_ctx = NULL };
@@ -509,6 +506,9 @@ void start_webserver(void) {
             httpd_uri_t uri_loop     = { .uri = "/api/loop", .method = HTTP_GET, .handler = loop_get_handler, .user_ctx = NULL };
             httpd_uri_t uri_favicon  = { .uri = "/favicon.ico", .method = HTTP_GET, .handler = favicon_get_handler, .user_ctx = NULL };
             
+            // The Wildcard Catchall (must be registered last!)
+            httpd_uri_t uri_catchall = { .uri = "/*", .method = HTTP_GET, .handler = captive_portal_wildcard_handler, .user_ctx = NULL };
+            
             httpd_register_uri_handler(server, &uri_root);
             httpd_register_uri_handler(server, &uri_setup);
             httpd_register_uri_handler(server, &uri_app);
@@ -520,8 +520,8 @@ void start_webserver(void) {
             httpd_register_uri_handler(server, &uri_loop);
             httpd_register_uri_handler(server, &uri_favicon);
             
-            // Register Captive Portal 404 Handler
-            httpd_register_err_handler(server, HTTPD_404_NOT_FOUND, not_found_handler);
+            // Register Catch-all to intercept OS checks silently
+            httpd_register_uri_handler(server, &uri_catchall);
             
             ESP_LOGI(TAG, "Web Server started on port %d", config.server_port);
         }
@@ -545,8 +545,6 @@ extern "C" void app_main(void) {
     init_motor_pwm();
     xTaskCreate(motor_control_task, "motor_task", 4096, NULL, 4, NULL);
     xTaskCreate(console_task, "console_task", 4096, NULL, 5, NULL);
-    
-    // --> MOVED DNS TASK OUT OF HERE. IT MUST WAIT UNTIL AFTER NETIF INIT.
 
     // 3. Initialize Network Base
     ESP_ERROR_CHECK(esp_netif_init());
@@ -623,7 +621,7 @@ extern "C" void app_main(void) {
 
     // 7. Start Sub-systems now that the TCP/IP network stack is up
     start_webserver();
-    xTaskCreate(dns_server_task, "dns_task", 4096, NULL, 5, NULL); // Start DNS interceptor task safely
+    xTaskCreate(dns_server_task, "dns_task", 4096, NULL, 5, NULL);
 
     while (1) {
         // Main Loop
