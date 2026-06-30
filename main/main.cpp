@@ -108,7 +108,7 @@ void motor_control_task(void *pvParameter) {
 }
 
 // ============================================================================
-// CONSOLE INPUT TASK (Handles Ctrl+C and Ctrl+D)
+// CONSOLE INPUT TASK
 // ============================================================================
 void console_task(void *pvParameters) {
     ESP_LOGI(TAG, "Console task started. Waiting for inputs...");
@@ -172,9 +172,20 @@ static void delayed_reboot_task(void *pvParameter) {
     esp_restart();
 }
 
-static esp_err_t index_get_handler(httpd_req_t *req) {
+// Root page intelligently redirects to either /setup or /app based on connection state
+static esp_err_t root_get_handler(httpd_req_t *req) {
+    httpd_resp_set_status(req, "302 Found");
     if (ap_fallback_active) {
-        const char* setup_html = R"raw_html(
+        httpd_resp_set_hdr(req, "Location", "/setup");
+    } else {
+        httpd_resp_set_hdr(req, "Location", "/app");
+    }
+    httpd_resp_send(req, NULL, 0);
+    return ESP_OK;
+}
+
+static esp_err_t setup_get_handler(httpd_req_t *req) {
+    const char* setup_html = R"raw_html(
 <!DOCTYPE html><html><head><meta charset="utf-8"><title>ESP Setup</title><meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
     :root { --primary: #0ea5e9; --bg: #0f172a; --card: #1e293b; --text: #f1f5f9; }
@@ -187,11 +198,12 @@ static esp_err_t index_get_handler(httpd_req_t *req) {
     button:active { transform: scale(0.96); opacity: 0.9; }
     .btn-green { background: #10b981; }
     .btn-red { background: #ef4444; }
+    .btn-blue { background: #3b82f6; }
     .status-bar { padding: 12px; border-radius: 10px; font-weight: bold; text-align: center; font-size: 0.85rem; border: 1px solid; text-transform: uppercase; background: #451a03; color: #fbbf24; border-color: #f59e0b; }
 </style></head>
 <body>
     <div class="container">
-        <div class="status-bar">SETUP MODE: AP ACTIVE</div>
+        <div class="status-bar">WIFI SETUP MODE</div>
         <div class="card">
             <h2>WiFi Setup</h2>
             <div id="status-msg" style="font-size:0.8rem;color:#64748b;margin-bottom:5px">Ready to Scan</div>
@@ -199,7 +211,8 @@ static esp_err_t index_get_handler(httpd_req_t *req) {
             <select id="ssid" style="margin-top:10px;"><option value="">-- Select --</option></select>
             <input type="password" id="pass" placeholder="Password">
             <button class="btn-green" onclick="save()">Save and Reboot</button>
-            <button class="btn-red" onclick="resetData()">Factory Reset Device</button>
+            <button class="btn-blue" style="margin-top:15px;" onclick="location.href='/app'">Skip to Fan Control</button>
+            <button class="btn-red" style="margin-top:15px;" onclick="resetData()">Factory Reset Device</button>
         </div>
     </div>
     <script>
@@ -223,9 +236,12 @@ static esp_err_t index_get_handler(httpd_req_t *req) {
     </script>
 </body></html>
 )raw_html";
-        httpd_resp_send(req, setup_html, HTTPD_RESP_USE_STRLEN);
-    } else {
-        const char* app_html = R"raw_html(
+    httpd_resp_send(req, setup_html, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+static esp_err_t app_get_handler(httpd_req_t *req) {
+    const char* app_html = R"raw_html(
 <!DOCTYPE html><html><head><meta charset="utf-8"><title>Fan Control</title><meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
     :root { --primary: #0ea5e9; --bg: #0f172a; --card: #1e293b; --text: #f1f5f9; }
@@ -269,13 +285,12 @@ static esp_err_t index_get_handler(httpd_req_t *req) {
                 <button class="btn-gray" onclick="sendCmd('/api/throttle?val=100','Forward Max', 100)">Fwd</button>
             </div>
             <button class="btn-blue" onclick="sendCmd('/api/loop','Breeze Mode')">Breeze Mode</button>
-            <button class="btn-gray" style="margin-top:20px; background:#451a03;" onclick="if(confirm('Factory Reset?')) { fetch('/reset', {method:'POST'}).then(()=>alert('Rebooting')); }">Factory Reset</button>
+            <button class="btn-gray" style="margin-top:20px; background:#0f172a; border:1px solid #475569;" onclick="location.href='/setup'">Go to Wi-Fi Setup</button>
         </div>
     </div>
 </body></html>
 )raw_html";
-        httpd_resp_send(req, app_html, HTTPD_RESP_USE_STRLEN);
-    }
+    httpd_resp_send(req, app_html, HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
 }
 
@@ -396,7 +411,6 @@ static esp_err_t loop_get_handler(httpd_req_t *req) {
     return ESP_OK;
 }
 
-// Resolves the 404 missing favicon log error transparently
 static esp_err_t favicon_get_handler(httpd_req_t *req) {
     httpd_resp_set_status(req, "204 No Content");
     httpd_resp_send(req, NULL, 0);
@@ -406,11 +420,13 @@ static esp_err_t favicon_get_handler(httpd_req_t *req) {
 void start_webserver(void) {
     if (server == NULL) {
         httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-        config.max_uri_handlers = 12; // Increased size to allow new api endpoints
+        config.max_uri_handlers = 12;
         config.stack_size = 8192;
         
         if (httpd_start(&server, &config) == ESP_OK) {
-            httpd_uri_t uri_index    = { .uri = "/", .method = HTTP_GET, .handler = index_get_handler, .user_ctx = NULL };
+            httpd_uri_t uri_root     = { .uri = "/", .method = HTTP_GET, .handler = root_get_handler, .user_ctx = NULL };
+            httpd_uri_t uri_setup    = { .uri = "/setup", .method = HTTP_GET, .handler = setup_get_handler, .user_ctx = NULL };
+            httpd_uri_t uri_app      = { .uri = "/app", .method = HTTP_GET, .handler = app_get_handler, .user_ctx = NULL };
             httpd_uri_t uri_scan     = { .uri = "/scan", .method = HTTP_GET, .handler = scan_get_handler, .user_ctx = NULL };
             httpd_uri_t uri_save     = { .uri = "/save", .method = HTTP_POST, .handler = save_post_handler, .user_ctx = NULL };
             httpd_uri_t uri_reset    = { .uri = "/reset", .method = HTTP_POST, .handler = reset_post_handler, .user_ctx = NULL };
@@ -419,7 +435,9 @@ void start_webserver(void) {
             httpd_uri_t uri_loop     = { .uri = "/api/loop", .method = HTTP_GET, .handler = loop_get_handler, .user_ctx = NULL };
             httpd_uri_t uri_favicon  = { .uri = "/favicon.ico", .method = HTTP_GET, .handler = favicon_get_handler, .user_ctx = NULL };
             
-            httpd_register_uri_handler(server, &uri_index);
+            httpd_register_uri_handler(server, &uri_root);
+            httpd_register_uri_handler(server, &uri_setup);
+            httpd_register_uri_handler(server, &uri_app);
             httpd_register_uri_handler(server, &uri_scan);
             httpd_register_uri_handler(server, &uri_save);
             httpd_register_uri_handler(server, &uri_reset);
@@ -502,7 +520,7 @@ extern "C" void app_main(void) {
 
     ESP_ERROR_CHECK(esp_wifi_start());
 
-    // Fix for ESP32-C3 SuperMini Wi-Fi dropout & invisibility issues
+    // Fix for ESP32-C3 SuperMini Wi-Fi dropout issues
     ESP_LOGI(TAG, "Configuring TX Power to 8.5 dBm to mitigate onboard antenna mismatch...");
     ESP_ERROR_CHECK(esp_wifi_set_max_tx_power(34)); // 34 * 0.25 dBm = 8.5 dBm
 
