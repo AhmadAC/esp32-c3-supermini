@@ -252,6 +252,7 @@ static esp_err_t root_get_handler(httpd_req_t *req) {
 }
 
 // Intercepts all OS connectivity checks seamlessly (silences "URI not found" warnings)
+// Handles GET, POST (e.g. WeChat /mmtls/), and HEAD captive portal probes.
 static esp_err_t captive_portal_wildcard_handler(httpd_req_t *req) {
     httpd_resp_set_status(req, "302 Found");
     if (ap_fallback_active) {
@@ -498,7 +499,7 @@ static esp_err_t favicon_get_handler(httpd_req_t *req) {
 void start_webserver(void) {
     if (server == NULL) {
         httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-        config.max_uri_handlers = 16;
+        config.max_uri_handlers = 24; // Increased to accommodate POST and HEAD catchalls
         config.stack_size = 8192;
         config.uri_match_fn = httpd_uri_match_wildcard;
         
@@ -514,8 +515,10 @@ void start_webserver(void) {
             httpd_uri_t uri_loop     = { .uri = "/api/loop", .method = HTTP_GET, .handler = loop_get_handler, .user_ctx = NULL };
             httpd_uri_t uri_favicon  = { .uri = "/favicon.ico", .method = HTTP_GET, .handler = favicon_get_handler, .user_ctx = NULL };
             
-            // The Wildcard Catchall (must be registered last!)
-            httpd_uri_t uri_catchall = { .uri = "/*", .method = HTTP_GET, .handler = captive_portal_wildcard_handler, .user_ctx = NULL };
+            // Catchalls for Captive Portal (must be registered last!)
+            httpd_uri_t uri_catchall_get  = { .uri = "/*", .method = HTTP_GET, .handler = captive_portal_wildcard_handler, .user_ctx = NULL };
+            httpd_uri_t uri_catchall_post = { .uri = "/*", .method = HTTP_POST, .handler = captive_portal_wildcard_handler, .user_ctx = NULL };
+            httpd_uri_t uri_catchall_head = { .uri = "/*", .method = HTTP_HEAD, .handler = captive_portal_wildcard_handler, .user_ctx = NULL };
             
             httpd_register_uri_handler(server, &uri_root);
             httpd_register_uri_handler(server, &uri_setup);
@@ -527,7 +530,9 @@ void start_webserver(void) {
             httpd_register_uri_handler(server, &uri_stop);
             httpd_register_uri_handler(server, &uri_loop);
             httpd_register_uri_handler(server, &uri_favicon);
-            httpd_register_uri_handler(server, &uri_catchall);
+            httpd_register_uri_handler(server, &uri_catchall_get);
+            httpd_register_uri_handler(server, &uri_catchall_post);
+            httpd_register_uri_handler(server, &uri_catchall_head);
             
             ESP_LOGI(TAG, "Web Server started on port %d", config.server_port);
         }
@@ -539,6 +544,11 @@ void start_webserver(void) {
 // ============================================================================
 extern "C" void app_main(void) {
     ESP_LOGI(TAG, "ESP32-C3 SuperMini Booting up!");
+
+    // Silence unavoidable HTTP server warnings caused by background smartphone apps and HTTPS/TLS traffic hitting the HTTP port (80)
+    esp_log_level_set("httpd_parse", ESP_LOG_ERROR);
+    esp_log_level_set("httpd_txrx", ESP_LOG_ERROR);
+    esp_log_level_set("httpd_uri", ESP_LOG_ERROR);
 
     // 1. Initialize NVS
     esp_err_t ret = nvs_flash_init();
