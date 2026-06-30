@@ -545,7 +545,8 @@ extern "C" void app_main(void) {
     init_motor_pwm();
     xTaskCreate(motor_control_task, "motor_task", 4096, NULL, 4, NULL);
     xTaskCreate(console_task, "console_task", 4096, NULL, 5, NULL);
-    xTaskCreate(dns_server_task, "dns_task", 4096, NULL, 5, NULL); // Start DNS interceptor task
+    
+    // --> MOVED DNS TASK OUT OF HERE. IT MUST WAIT UNTIL AFTER NETIF INIT.
 
     // 3. Initialize Network Base
     ESP_ERROR_CHECK(esp_netif_init());
@@ -620,8 +621,9 @@ extern "C" void app_main(void) {
         ESP_LOGW(TAG, "No Wi-Fi saved. Fallback AP active (Connect to 'SuperMini_Config' / 192.168.4.1)");
     }
 
-    // 7. Start Sub-systems
+    // 7. Start Sub-systems now that the TCP/IP network stack is up
     start_webserver();
+    xTaskCreate(dns_server_task, "dns_task", 4096, NULL, 5, NULL); // Start DNS interceptor task safely
 
     while (1) {
         // Main Loop
