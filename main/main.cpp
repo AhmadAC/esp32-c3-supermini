@@ -1,5 +1,7 @@
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
+#include <math.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
@@ -12,12 +14,98 @@
 #include "esp_http_server.h"
 #include "cJSON.h"
 #include "esp_timer.h"
+#include "driver/ledc.h"
 
 static const char *TAG = "SUPERMINI";
 
 httpd_handle_t server = NULL;
 static int64_t disconnect_time = 0;
 static bool ap_fallback_active = false;
+
+// ============================================================================
+// MOTOR CONTROL GLOBALS & TASK
+// ============================================================================
+#define MOTOR_PIN_A 6
+#define MOTOR_PIN_B 5
+
+static float target_throttle = 0.0f;
+static float current_throttle = 0.0f;
+static bool breeze_mode = false;
+static float loop_dir = 1.0f;
+
+void init_motor_pwm(void) {
+    ledc_timer_config_t timer_cfg = {};
+    timer_cfg.speed_mode = LEDC_LOW_SPEED_MODE;
+    timer_cfg.duty_resolution = LEDC_TIMER_10_BIT; // 0 to 1023
+    timer_cfg.timer_num = LEDC_TIMER_0;
+    timer_cfg.freq_hz = 1000;
+    timer_cfg.clk_cfg = LEDC_AUTO_CLK;
+    ledc_timer_config(&timer_cfg);
+
+    ledc_channel_config_t ch_cfg_a = {};
+    ch_cfg_a.speed_mode = LEDC_LOW_SPEED_MODE;
+    ch_cfg_a.channel = LEDC_CHANNEL_0;
+    ch_cfg_a.timer_sel = LEDC_TIMER_0;
+    ch_cfg_a.intr_type = LEDC_INTR_DISABLE;
+    ch_cfg_a.gpio_num = MOTOR_PIN_A;
+    ch_cfg_a.duty = 0;
+    ch_cfg_a.hpoint = 0;
+    ledc_channel_config(&ch_cfg_a);
+
+    ledc_channel_config_t ch_cfg_b = {};
+    ch_cfg_b.speed_mode = LEDC_LOW_SPEED_MODE;
+    ch_cfg_b.channel = LEDC_CHANNEL_1;
+    ch_cfg_b.timer_sel = LEDC_TIMER_0;
+    ch_cfg_b.intr_type = LEDC_INTR_DISABLE;
+    ch_cfg_b.gpio_num = MOTOR_PIN_B;
+    ch_cfg_b.duty = 0;
+    ch_cfg_b.hpoint = 0;
+    ledc_channel_config(&ch_cfg_b);
+}
+
+void motor_control_task(void *pvParameter) {
+    const float step = 5.0f; // 5 percent per 100ms prevents brownouts
+    while (1) {
+        if (breeze_mode) {
+            float nxt = current_throttle + (loop_dir * step);
+            if (nxt >= 100.0f || nxt <= 30.0f) {
+                loop_dir *= -1.0f;
+            }
+            if (nxt > 100.0f) nxt = 100.0f;
+            if (nxt < 30.0f) nxt = 30.0f;
+            current_throttle = nxt;
+        } else {
+            float diff = target_throttle - current_throttle;
+            if (fabs(diff) < step) {
+                current_throttle = target_throttle;
+            } else {
+                current_throttle += (diff > 0) ? step : -step;
+            }
+        }
+
+        uint32_t duty = (uint32_t)(fabs(current_throttle) / 100.0f * 1023.0f);
+        if (duty > 1023) duty = 1023;
+
+        if (current_throttle > 0.1f) {
+            ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, duty);
+            ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
+            ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, 0);
+            ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1);
+        } else if (current_throttle < -0.1f) {
+            ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, 0);
+            ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
+            ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, duty);
+            ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1);
+        } else {
+            ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, 0);
+            ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
+            ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, 0);
+            ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(100)); 
+    }
+}
 
 // ============================================================================
 // CONSOLE INPUT TASK (Handles Ctrl+C and Ctrl+D)
@@ -27,10 +115,9 @@ void console_task(void *pvParameters) {
     while (1) {
         int c = getchar();
         if (c != EOF) {
-            if (c == 0x03) { // Ctrl+C (ETX)
+            if (c == 0x03) { 
                 ESP_LOGI(TAG, "Interrupt received (Ctrl+C)");
-                
-            } else if (c == 0x04) { // Ctrl+D (EOT)
+            } else if (c == 0x04) { 
                 ESP_LOGI(TAG, "Soft Reboot received (Ctrl+D). Rebooting...");
                 vTaskDelay(pdMS_TO_TICKS(100)); 
                 esp_restart();
@@ -42,7 +129,7 @@ void console_task(void *pvParameters) {
 }
 
 // ============================================================================
-// WI-FI EVENT HANDLER (Auto Reconnect & AP Fallback)
+// WI-FI EVENT HANDLER
 // ============================================================================
 static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data) {
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
@@ -86,71 +173,109 @@ static void delayed_reboot_task(void *pvParameter) {
 }
 
 static esp_err_t index_get_handler(httpd_req_t *req) {
-    const char* html = R"raw_html(
-<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="UTF-8">
-    <title>SuperMini Dashboard</title>
-    <meta name='viewport' content='width=device-width, initial-scale=1'>
-    <style>
-        body { font-family: 'Segoe UI', Arial, sans-serif; background: #eef2f3; margin: 0; padding: 20px; color: #333; }
-        .container { max-width: 600px; margin: 0 auto; }
-        h1 { text-align: center; color: #2c3e50; }
-        .card { background: white; border-radius: 12px; padding: 25px; box-shadow: 0 4px 15px rgba(0,0,0,0.05); }
-        label { display: block; margin-top: 15px; margin-bottom: 5px; font-weight: bold; }
-        button { background: #3498db; color: white; border: none; padding: 12px 20px; border-radius: 6px; cursor: pointer; width: 100%; margin-top: 15px; font-size: 16px; }
-        button:hover { background: #2980b9; }
-        select, input[type=password] { width: 100%; padding: 10px; box-sizing: border-box; border: 1px solid #ccc; border-radius: 6px; }
-        #status { font-weight: bold; color: #16a085; text-align: center; margin-top: 10px; }
-    </style>
-</head>
+    if (ap_fallback_active) {
+        const char* setup_html = R"raw_html(
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>ESP Setup</title><meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+    :root { --primary: #0ea5e9; --bg: #0f172a; --card: #1e293b; --text: #f1f5f9; }
+    body { font-family: -apple-system, sans-serif; background: var(--bg); color: var(--text); padding: 15px; display: flex; flex-direction: column; align-items: center; min-height: 100vh; margin:0;}
+    .container { width: 100%; max-width: 420px; }
+    .card { background: var(--card); padding: 25px; border-radius: 20px; border: 1px solid #334155; text-align: center; margin-top: 15px; }
+    h2 { color: var(--primary); margin-top: 0; }
+    input, select { width: 100%; padding: 12px; margin: 8px 0 20px; border-radius: 10px; border: 1px solid #475569; background: #0f172a; color: white; box-sizing: border-box; }
+    button { width: 100%; padding: 15px; border: none; border-radius: 12px; font-weight: bold; cursor: pointer; color: white; margin-top:10px; transition: transform 0.1s; }
+    button:active { transform: scale(0.96); opacity: 0.9; }
+    .btn-green { background: #10b981; }
+    .btn-red { background: #ef4444; }
+    .status-bar { padding: 12px; border-radius: 10px; font-weight: bold; text-align: center; font-size: 0.85rem; border: 1px solid; text-transform: uppercase; background: #451a03; color: #fbbf24; border-color: #f59e0b; }
+</style></head>
 <body>
-<div class='container'>
-    <h1>SuperMini Config</h1>
-    <div class='card'>
-        <button onclick='scan()'>Scan Wi-Fi Networks</button>
-        <p id='status'></p>
-        
-        <label>Target SSID:</label>
-        <select id='ssid'></select>
-        
-        <label>Wi-Fi Password:</label>
-        <input type='password' id='pass' placeholder='Enter password'>
-        
-        <button style='background: #27ae60;' onclick='saveWiFi()'>Save and Reboot</button>
-        <button style='background: #e74c3c; margin-top: 10px;' onclick='resetData()'>Factory Reset Device</button>
+    <div class="container">
+        <div class="status-bar">SETUP MODE: AP ACTIVE</div>
+        <div class="card">
+            <h2>WiFi Setup</h2>
+            <div id="status-msg" style="font-size:0.8rem;color:#64748b;margin-bottom:5px">Ready to Scan</div>
+            <button class="btn-green" onclick="scan()">Scan Networks</button>
+            <select id="ssid" style="margin-top:10px;"><option value="">-- Select --</option></select>
+            <input type="password" id="pass" placeholder="Password">
+            <button class="btn-green" onclick="save()">Save and Reboot</button>
+            <button class="btn-red" onclick="resetData()">Factory Reset Device</button>
+        </div>
     </div>
-</div>
-<script>
-    function fetchJSON(url, bodyData) {
-        return fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(bodyData) });
+    <script>
+    function scan(){
+        document.getElementById('status-msg').innerText="Scanning...";
+        fetch('/scan').then(r=>r.json()).then(d=>{
+            const s=document.getElementById('ssid'); s.innerHTML='<option value="">-- Select --</option>';
+            d.forEach(n=>{let o=document.createElement('option');o.value=n;o.innerText=n;s.appendChild(o)});
+            document.getElementById('status-msg').innerText="Networks Found: " + d.length;
+        }).catch(()=>{ document.getElementById('status-msg').innerText="Scan Error"; });
     }
-    function scan() {
-        document.getElementById('status').innerText = 'Scanning Wi-Fi...';
-        fetch('/scan').then(r => r.json()).then(d => {
-            let s = document.getElementById('ssid');
-            s.innerHTML = '';
-            d.forEach(n => { s.innerHTML += '<option value="'+n+'">'+n+'</option>'; });
-            document.getElementById('status').innerText = 'Found ' + d.length + ' network(s)';
+    function save(){
+        const s=document.getElementById('ssid').value, p=document.getElementById('pass').value;
+        if(!s) return alert('Select SSID');
+        fetch('/save', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ssid: s, pass: p}) })
+        .then(r=>r.text()).then(t=>{ alert('Saved! Rebooting...'); });
+    }
+    function resetData(){
+        if(confirm("Are you sure?")) fetch('/reset', { method: 'POST' }).then(() => alert('Resetting...'));
+    }
+    </script>
+</body></html>
+)raw_html";
+        httpd_resp_send(req, setup_html, HTTPD_RESP_USE_STRLEN);
+    } else {
+        const char* app_html = R"raw_html(
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>Fan Control</title><meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+    :root { --primary: #0ea5e9; --bg: #0f172a; --card: #1e293b; --text: #f1f5f9; }
+    body { font-family: -apple-system, sans-serif; background: var(--bg); color: var(--text); padding: 15px; display: flex; flex-direction: column; align-items: center; min-height: 100vh; margin:0;}
+    .container { width: 100%; max-width: 420px; }
+    .card { background: var(--card); padding: 25px; border-radius: 20px; border: 1px solid #334155; text-align: center; margin-top: 15px; }
+    button { width: 100%; padding: 15px; border: none; border-radius: 12px; font-weight: bold; cursor: pointer; color: white; transition: transform 0.1s; }
+    button:active { transform: scale(0.96); opacity: 0.9; }
+    .btn-blue { background: #3b82f6; margin-top:10px; }
+    .btn-red { background: #ef4444; }
+    .btn-gray { background: #475569; }
+    .status-bar { padding: 12px; border-radius: 10px; font-weight: bold; text-align: center; font-size: 0.85rem; border: 1px solid; text-transform: uppercase; background: #172554; color: #93c5fd; border-color: #3b82f6; }
+    .grid-3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; margin-top: 20px; }
+    input[type=range] { -webkit-appearance: none; background: transparent; width: 100%; margin: 20px 0; }
+    input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; height: 24px; width: 24px; border-radius: 50%; background: var(--primary); margin-top: -10px; }
+    input[type=range]::-webkit-slider-runnable-track { width: 100%; height: 4px; background: #475569; border-radius: 2px; }
+</style>
+<script>
+    function updateThrottle(val) {
+        let d = val == 0 ? "Stopped" : (val > 0 ? "Forward " + val + "%" : "Reverse " + Math.abs(val) + "%");
+        document.getElementById('disp').innerText = d;
+        fetch('/api/throttle?val=' + val);
+    }
+    function sendCmd(u, d_text, d_val) {
+        fetch(u).then(() => {
+            if(d_text) document.getElementById('disp').innerText = d_text;
+            if(d_val !== undefined) document.getElementById('slider').value = d_val;
         });
     }
-    function saveWiFi() {
-        let s = document.getElementById('ssid').value;
-        let p = document.getElementById('pass').value;
-        if(!s) return;
-        fetchJSON('/save', {ssid: s, pass: p}).then(() => alert('Credentials Saved! Device Rebooting...'));
-    }
-    function resetData() {
-        if(confirm("Are you sure you want to format NVS?")) {
-            fetchJSON('/reset', {}).then(() => alert('Resetting...'));
-        }
-    }
 </script>
-</body>
-</html>
+</head>
+<body>
+    <div class="container">
+        <div class="status-bar">FAN CONTROL ONLINE</div>
+        <div class="card">
+            <h2 id="disp" style="font-size:1.8rem;margin:15px 0;color:white;text-shadow:0 0 10px #0ea5e9">Stopped</h2>
+            <input type="range" id="slider" min="-100" max="100" value="0" step="5" oninput="updateThrottle(this.value)">
+            <div class="grid-3">
+                <button class="btn-gray" onclick="sendCmd('/api/throttle?val=-100','Reverse Max', -100)">Rev</button>
+                <button class="btn-red" onclick="sendCmd('/api/stop','Stopped', 0)">STOP</button>
+                <button class="btn-gray" onclick="sendCmd('/api/throttle?val=100','Forward Max', 100)">Fwd</button>
+            </div>
+            <button class="btn-blue" onclick="sendCmd('/api/loop','Breeze Mode')">Breeze Mode</button>
+            <button class="btn-gray" style="margin-top:20px; background:#451a03;" onclick="if(confirm('Factory Reset?')) { fetch('/reset', {method:'POST'}).then(()=>alert('Rebooting')); }">Factory Reset</button>
+        </div>
+    </div>
+</body></html>
 )raw_html";
-    httpd_resp_send(req, html, HTTPD_RESP_USE_STRLEN);
+        httpd_resp_send(req, app_html, HTTPD_RESP_USE_STRLEN);
+    }
     return ESP_OK;
 }
 
@@ -243,22 +368,65 @@ static esp_err_t reset_post_handler(httpd_req_t *req) {
     return ESP_OK;
 }
 
+static esp_err_t throttle_get_handler(httpd_req_t *req) {
+    char buf[64];
+    if (httpd_req_get_url_query_str(req, buf, sizeof(buf)) == ESP_OK) {
+        char param[32];
+        if (httpd_query_key_value(buf, "val", param, sizeof(param)) == ESP_OK) {
+            target_throttle = atof(param);
+            if (target_throttle > 100.0f) target_throttle = 100.0f;
+            if (target_throttle < -100.0f) target_throttle = -100.0f;
+            breeze_mode = false;
+        }
+    }
+    httpd_resp_sendstr(req, "OK");
+    return ESP_OK;
+}
+
+static esp_err_t stop_get_handler(httpd_req_t *req) {
+    target_throttle = 0.0f;
+    breeze_mode = false;
+    httpd_resp_sendstr(req, "OK");
+    return ESP_OK;
+}
+
+static esp_err_t loop_get_handler(httpd_req_t *req) {
+    breeze_mode = true;
+    httpd_resp_sendstr(req, "OK");
+    return ESP_OK;
+}
+
+// Resolves the 404 missing favicon log error transparently
+static esp_err_t favicon_get_handler(httpd_req_t *req) {
+    httpd_resp_set_status(req, "204 No Content");
+    httpd_resp_send(req, NULL, 0);
+    return ESP_OK;
+}
+
 void start_webserver(void) {
     if (server == NULL) {
         httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-        config.max_uri_handlers = 8;
+        config.max_uri_handlers = 12; // Increased size to allow new api endpoints
         config.stack_size = 8192;
         
         if (httpd_start(&server, &config) == ESP_OK) {
-            httpd_uri_t uri_index = { .uri = "/", .method = HTTP_GET, .handler = index_get_handler, .user_ctx = NULL };
-            httpd_uri_t uri_scan  = { .uri = "/scan", .method = HTTP_GET, .handler = scan_get_handler, .user_ctx = NULL };
-            httpd_uri_t uri_save  = { .uri = "/save", .method = HTTP_POST, .handler = save_post_handler, .user_ctx = NULL };
-            httpd_uri_t uri_reset = { .uri = "/reset", .method = HTTP_POST, .handler = reset_post_handler, .user_ctx = NULL };
+            httpd_uri_t uri_index    = { .uri = "/", .method = HTTP_GET, .handler = index_get_handler, .user_ctx = NULL };
+            httpd_uri_t uri_scan     = { .uri = "/scan", .method = HTTP_GET, .handler = scan_get_handler, .user_ctx = NULL };
+            httpd_uri_t uri_save     = { .uri = "/save", .method = HTTP_POST, .handler = save_post_handler, .user_ctx = NULL };
+            httpd_uri_t uri_reset    = { .uri = "/reset", .method = HTTP_POST, .handler = reset_post_handler, .user_ctx = NULL };
+            httpd_uri_t uri_throttle = { .uri = "/api/throttle", .method = HTTP_GET, .handler = throttle_get_handler, .user_ctx = NULL };
+            httpd_uri_t uri_stop     = { .uri = "/api/stop", .method = HTTP_GET, .handler = stop_get_handler, .user_ctx = NULL };
+            httpd_uri_t uri_loop     = { .uri = "/api/loop", .method = HTTP_GET, .handler = loop_get_handler, .user_ctx = NULL };
+            httpd_uri_t uri_favicon  = { .uri = "/favicon.ico", .method = HTTP_GET, .handler = favicon_get_handler, .user_ctx = NULL };
             
             httpd_register_uri_handler(server, &uri_index);
             httpd_register_uri_handler(server, &uri_scan);
             httpd_register_uri_handler(server, &uri_save);
             httpd_register_uri_handler(server, &uri_reset);
+            httpd_register_uri_handler(server, &uri_throttle);
+            httpd_register_uri_handler(server, &uri_stop);
+            httpd_register_uri_handler(server, &uri_loop);
+            httpd_register_uri_handler(server, &uri_favicon);
             
             ESP_LOGI(TAG, "Web Server started on port %d", config.server_port);
         }
@@ -278,7 +446,12 @@ extern "C" void app_main(void) {
         ESP_ERROR_CHECK(nvs_flash_init());
     }
 
-    // 2. Initialize Network Base
+    // 2. Initialize Hardware & Tasks
+    init_motor_pwm();
+    xTaskCreate(motor_control_task, "motor_task", 4096, NULL, 4, NULL);
+    xTaskCreate(console_task, "console_task", 4096, NULL, 5, NULL);
+
+    // 3. Initialize Network Base
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     
@@ -293,7 +466,7 @@ extern "C" void app_main(void) {
     ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED, &wifi_event_handler, NULL, &instance_any_id));
     ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, &instance_got_ip));
 
-    // 3. Configure Fallback AP Mode parameters
+    // 4. Configure Fallback AP Mode parameters
     wifi_config_t ap_config = {};
     strcpy((char*)ap_config.ap.ssid, "SuperMini_Config");
     ap_config.ap.ssid_len = strlen("SuperMini_Config");
@@ -304,7 +477,7 @@ extern "C" void app_main(void) {
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_config));
 
-    // 4. Retrieve saved credentials
+    // 5. Retrieve saved credentials
     nvs_handle_t my_handle;
     bool has_creds = false;
     char ssid[33] = {0}; 
@@ -333,12 +506,15 @@ extern "C" void app_main(void) {
     ESP_LOGI(TAG, "Configuring TX Power to 8.5 dBm to mitigate onboard antenna mismatch...");
     ESP_ERROR_CHECK(esp_wifi_set_max_tx_power(34)); // 34 * 0.25 dBm = 8.5 dBm
 
-    // 5. Connect to network if credentials exist
+    // 6. Connect to network if credentials exist
     if (has_creds) {
         ESP_LOGI(TAG, "Connecting to saved network: %s", ssid);
         wifi_config_t sta_config = {};
         strncpy((char*)sta_config.sta.ssid, ssid, 32);
         strncpy((char*)sta_config.sta.password, pass, 64);
+        
+        sta_config.sta.pmf_cfg.capable = true;
+        sta_config.sta.pmf_cfg.required = false;
         
         ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta_config));
         
@@ -348,9 +524,8 @@ extern "C" void app_main(void) {
         ESP_LOGW(TAG, "No Wi-Fi saved. Fallback AP active (Connect to 'SuperMini_Config' / 192.168.4.1)");
     }
 
-    // 6. Start Sub-systems
+    // 7. Start Sub-systems
     start_webserver();
-    xTaskCreate(console_task, "console_task", 4096, NULL, 5, NULL);
 
     while (1) {
         // Main Loop
